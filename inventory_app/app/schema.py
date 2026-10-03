@@ -1,0 +1,91 @@
+"""スキーマとマイグレーション。
+
+MIGRATIONS に SQL を末尾へ追加していくだけ。適用済みの番号は PRAGMA user_version に保存される。
+(旧版の SQLAlchemy + Alembic で作ったDBも、同じ構造なので user_version=1 として引き継ぐ)
+"""
+
+MIGRATIONS = [
+    # 1: 初期スキーマ
+    """
+CREATE TABLE "user" (
+  id INTEGER PRIMARY KEY,
+  username TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'staff',
+  is_active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE category (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  uses_color INTEGER NOT NULL DEFAULT 1,
+  uses_size INTEGER NOT NULL DEFAULT 0,
+  uses_variant_name INTEGER NOT NULL DEFAULT 0,
+  is_printable INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE item (
+  id INTEGER PRIMARY KEY,
+  category_id INTEGER NOT NULL REFERENCES category(id),
+  brand TEXT NOT NULL DEFAULT '',
+  item_no TEXT NOT NULL DEFAULT '',
+  name TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  is_active INTEGER NOT NULL DEFAULT 1,
+  UNIQUE (category_id, brand, item_no)
+);
+CREATE TABLE variant (
+  id INTEGER PRIMARY KEY,
+  item_id INTEGER NOT NULL REFERENCES item(id),
+  color TEXT NOT NULL DEFAULT '',
+  size TEXT NOT NULL DEFAULT '',
+  variant_name TEXT NOT NULL DEFAULT '',
+  quantity INTEGER NOT NULL DEFAULT 0 CHECK (quantity >= 0),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (item_id, color, size, variant_name)
+);
+CREATE TABLE design (
+  id INTEGER PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE printed_product (
+  id INTEGER PRIMARY KEY,
+  design_id INTEGER NOT NULL REFERENCES design(id),
+  variant_id INTEGER NOT NULL REFERENCES variant(id),
+  quantity INTEGER NOT NULL DEFAULT 0 CHECK (quantity >= 0),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (design_id, variant_id)
+);
+CREATE TABLE stock_movement (
+  id INTEGER PRIMARY KEY,
+  batch_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  variant_id INTEGER REFERENCES variant(id),
+  printed_product_id INTEGER REFERENCES printed_product(id),
+  delta INTEGER NOT NULL CHECK (delta <> 0),
+  note TEXT NOT NULL DEFAULT '',
+  user_id INTEGER NOT NULL REFERENCES "user"(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  CHECK ((variant_id IS NULL) <> (printed_product_id IS NULL))
+);
+CREATE INDEX ix_stock_movement_batch_id ON stock_movement(batch_id);
+CREATE INDEX ix_stock_movement_created_at ON stock_movement(created_at);
+""",
+]
+
+
+def current_version(db) -> int:
+    return db.execute("PRAGMA user_version").fetchone()["user_version"]
+
+
+def migrate(db) -> int:
+    v = current_version(db)
+    has_tables = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='category'").fetchone()
+    if v == 0 and has_tables:  # 旧版で作成済みのDB
+        db.execute("PRAGMA user_version=1")
+        v = 1
+    for n, sql in enumerate(MIGRATIONS[v:], start=v + 1):
+        db.executescript(f"BEGIN;\n{sql}\nPRAGMA user_version={n};\nCOMMIT;")
+    return current_version(db)
