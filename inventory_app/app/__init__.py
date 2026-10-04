@@ -155,12 +155,34 @@ def register_cli(app):
                     (name, i, c, s, v, p))
         click.echo("初期カテゴリーを登録しました。")
 
+    @app.cli.command("list-users")
+    def list_users():
+        """登録済みのユーザー名・権限・有効/無効を表示する(パスワードは表示しない)。"""
+        path = app.config["DATABASE"]
+        # 存在しないファイルに接続すると空のDBが勝手に作られてしまうので、先に確かめる
+        if not os.path.exists(path):
+            raise click.ClickException(f"DBがありません({path})。先に flask init-db を実行してください。")
+        try:
+            rows = get_db().execute(
+                'SELECT username, role, is_active FROM "user" ORDER BY id').fetchall()
+        except sqlite3.OperationalError:
+            raise click.ClickException("DBが初期化されていません。先に flask init-db を実行してください。")
+        if not rows:
+            click.echo("ユーザーはまだ登録されていません。(flask create-user --admin 名前 で作成できます)")
+            return
+        for r in rows:
+            role = "管理者" if r["role"] == "admin" else "スタッフ"
+            click.echo(f"{r['username']}\t{role}\t{'有効' if r['is_active'] else '無効'}")
+
     @app.cli.command("create-user")
     @click.argument("username")
     @click.option("--admin", is_flag=True, help="管理者として作成")
     @click.password_option()
     def create_user(username, admin, password):
         """ユーザーを作成する。"""
+        username = username.strip()  # ログイン画面・管理画面と同じ扱い。空白付きだと二度とログインできない
+        if not username:
+            raise click.ClickException("ユーザー名を入力してください。")
         role = "admin" if admin else "staff"
         try:
             with transaction() as db:

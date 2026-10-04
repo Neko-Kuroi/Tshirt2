@@ -1,0 +1,85 @@
+diff --git a/inventory_app/app/__init__.py b/inventory_app/app/__init__.py
+index cf0b43e..5634671 100644
+--- a/inventory_app/app/__init__.py
++++ b/inventory_app/app/__init__.py
+@@ -155,6 +155,25 @@ def register_cli(app):
+                     (name, i, c, s, v, p))
+         click.echo("初期カテゴリーを登録しました。")
+ 
++    @app.cli.command("list-users")
++    def list_users():
++        """登録済みのユーザー名・権限・有効/無効を表示する(パスワードは表示しない)。"""
++        path = app.config["DATABASE"]
++        # 存在しないファイルに接続すると空のDBが勝手に作られてしまうので、先に確かめる
++        if not os.path.exists(path):
++            raise click.ClickException(f"DBがありません({path})。先に flask init-db を実行してください。")
++        try:
++            rows = get_db().execute(
++                'SELECT username, role, is_active FROM "user" ORDER BY id').fetchall()
++        except sqlite3.OperationalError:
++            raise click.ClickException("DBが初期化されていません。先に flask init-db を実行してください。")
++        if not rows:
++            click.echo("ユーザーはまだ登録されていません。(flask create-user --admin 名前 で作成できます)")
++            return
++        for r in rows:
++            role = "管理者" if r["role"] == "admin" else "スタッフ"
++            click.echo(f"{r['username']}\t{role}\t{'有効' if r['is_active'] else '無効'}")
++
+     @app.cli.command("create-user")
+     @click.argument("username")
+     @click.option("--admin", is_flag=True, help="管理者として作成")
+diff --git a/inventory_app/tests/test_cli.py b/inventory_app/tests/test_cli.py
+new file mode 100644
+index 0000000..2cda25d
+--- /dev/null
++++ b/inventory_app/tests/test_cli.py
+@@ -0,0 +1,49 @@
++import os
++
++from app import create_app
++from app.db import get_db, transaction
++from app.schema import migrate
++from config import TestConfig
++
++
++def _runner(app, *args):
++    return app.test_cli_runner().invoke(args=list(args))
++
++
++def test_list_users_shows_name_role_and_status_but_not_the_hash(app):
++    with app.app_context(), transaction() as db:
++        db.execute('UPDATE "user" SET is_active = 0 WHERE username = ?', ("staff",))
++        pw_hash = db.execute('SELECT password_hash FROM "user" LIMIT 1').fetchone()["password_hash"]
++    r = _runner(app, "list-users")
++    assert r.exit_code == 0
++    lines = r.output.strip().splitlines()
++    assert lines == ["admin\t管理者\t有効", "staff\tスタッフ\t無効"]
++    assert pw_hash not in r.output
++
++
++def test_list_users_with_no_users(tmp_path):
++    class Cfg(TestConfig):
++        DATABASE = str(tmp_path / "empty.db")
++    app = create_app(Cfg)
++    with app.app_context():
++        migrate(get_db())
++    r = _runner(app, "list-users")
++    assert r.exit_code == 0 and "まだ登録されていません" in r.output
++
++
++def test_list_users_on_missing_db_does_not_create_it(tmp_path):
++    class Cfg(TestConfig):
++        DATABASE = str(tmp_path / "missing.db")
++    app = create_app(Cfg)
++    r = _runner(app, "list-users")
++    assert r.exit_code != 0 and "flask init-db" in r.output
++    assert not os.path.exists(Cfg.DATABASE)
++
++
++def test_list_users_on_uninitialized_db(tmp_path):
++    class Cfg(TestConfig):
++        DATABASE = str(tmp_path / "blank.db")
++    open(Cfg.DATABASE, "w").close()                    # 空ファイル(テーブルなし)
++    app = create_app(Cfg)
++    r = _runner(app, "list-users")
++    assert r.exit_code != 0 and "flask init-db" in r.output
