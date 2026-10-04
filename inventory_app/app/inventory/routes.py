@@ -164,7 +164,7 @@ def move():
 
 @bp.route("/history")
 def history():
-    page = max(to_int(request.args.get("page"), 1), 1)
+    page = min(max(to_int(request.args.get("page"), 1), 1), 100_000)  # OFFSET の計算が溢れないように
     kind = request.args.get("kind", "")
     pagination = repo.movements_page(kind, page, current_app.config["HISTORY_PER_PAGE"])
     return render_template("inventory/history.html", pagination=pagination, kind=kind, kinds=KINDS)

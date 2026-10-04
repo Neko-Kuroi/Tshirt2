@@ -3,7 +3,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import click
-from flask import Flask, render_template
+from flask import Flask, Response, render_template, request
 from flask_login import LoginManager
 from flask_wtf.csrf import CSRFError, CSRFProtect
 
@@ -16,6 +16,15 @@ login_manager.login_message_category = "warning"
 
 JST = timezone(timedelta(hours=9))
 
+_SCHEMA_PAGE = """<!doctype html>
+<html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>準備中</title></head>
+<body style="font-family:sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem">
+<h1 style="font-size:1.3rem">データベースの更新が必要です</h1>
+<p>管理者に連絡してください。</p>
+<p style="color:#666;font-size:.9rem">(管理者向け: サーバーで <code>flask init-db</code> を実行すると、再起動なしで使えるようになります)</p>
+</body></html>"""
+
 
 def create_app(config_object="config.Config"):
     app = Flask(__name__)
@@ -24,12 +33,15 @@ def create_app(config_object="config.Config"):
         config_object = import_string(config_object)
     app.config.from_object(config_object)
 
+    from .utils import BoundedIntegerConverter
+    app.url_map.converters["int"] = BoundedIntegerConverter  # blueprint登録より前に差し替える
+
     if app.config.get("BEHIND_PROXY"):
         from werkzeug.middleware.proxy_fix import ProxyFix
         app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
     from . import repo
-    from .db import close_db
+    from .db import close_db, get_db
 
     app.teardown_appcontext(close_db)
     login_manager.init_app(app)
@@ -69,6 +81,23 @@ def create_app(config_object="config.Config"):
     @app.errorhandler(500)
     def server_error(_):
         return error_page(500, "エラーが起きました。管理者に連絡してください。")
+
+    @app.before_request
+    def require_current_schema():
+        """DBが未作成/古いままだと、画面を開いて初めて500になる。先に分かりやすく止める。"""
+        if app.extensions.get("schema_ok") or request.endpoint == "static":
+            return None
+        from .schema import is_current
+        path = app.config["DATABASE"]
+        # 存在しないファイルに get_db() すると、空のDBが勝手に作られてしまうので先に確かめる
+        if os.path.exists(path) and is_current(get_db()):
+            app.extensions["schema_ok"] = True  # 更新が済めば、それ以降は確認しない
+            return None
+        if not app.extensions.get("schema_warned"):
+            app.extensions["schema_warned"] = True
+            app.logger.error("DBが未作成か古いバージョンです。`flask init-db` を実行してください: %s", path)
+        return Response(_SCHEMA_PAGE, 503, content_type="text/html; charset=utf-8",
+                        headers={"Retry-After": "60"})
 
     @app.after_request
     def no_cache(resp):

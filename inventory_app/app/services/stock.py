@@ -8,6 +8,7 @@ import uuid
 
 from .. import repo
 from ..db import get_db
+from ..utils import MAX_QTY
 
 _TABLE = {"variant": "variant", "product": "printed_product"}
 
@@ -41,6 +42,8 @@ def _log(batch_id, kind, user, delta, note, target):
 def _positive(n, label="数量") -> int:
     if not isinstance(n, int) or n <= 0:
         raise StockError(f"{label}は1以上の整数で入力してください。")
+    if n > MAX_QTY:
+        raise StockError(f"{label}は{MAX_QTY:,}以下で入力してください。")
     return n
 
 
@@ -109,6 +112,8 @@ def adjust(user, target, delta: int, note: str) -> str:
     """棚卸し調整。増減どちらも可。理由(note)は必須。"""
     if not isinstance(delta, int) or delta == 0:
         raise StockError("増減数は0以外の整数で入力してください。")
+    if abs(delta) > MAX_QTY:
+        raise StockError(f"増減数は{MAX_QTY:,}以下で入力してください。")
     if not _norm(note):
         raise StockError("棚卸し調整には理由を入力してください。")
     batch = str(uuid.uuid4())

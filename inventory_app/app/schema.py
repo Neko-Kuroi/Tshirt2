@@ -95,6 +95,11 @@ def current_version(db) -> int:
     return db.execute("PRAGMA user_version").fetchone()["user_version"]
 
 
+def is_current(db) -> bool:
+    """DBが最新のスキーマか。"""
+    return current_version(db) >= len(MIGRATIONS)
+
+
 def migrate(db) -> int:
     v = current_version(db)
     has_tables = db.execute(

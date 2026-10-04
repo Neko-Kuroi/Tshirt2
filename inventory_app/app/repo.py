@@ -3,6 +3,7 @@ import hmac
 
 from .db import get_db
 from .models import KINDS, User
+from .utils import to_int
 
 
 def _all(sql, args=()):
@@ -204,9 +205,8 @@ def designs():
 def get_target(raw):
     """フォームの 'v:12' / 'p:34' から在庫の行を引く。"""
     kind, _, rid = (raw or "").partition(":")
-    try:
-        rid = int(rid)
-    except ValueError:
+    rid = to_int(rid)
+    if rid is None:
         return None
     if kind == "v":
         return get_variant(rid)

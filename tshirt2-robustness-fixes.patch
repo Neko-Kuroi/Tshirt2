@@ -1,0 +1,340 @@
+diff --git a/inventory_app/README.md b/inventory_app/README.md
+index 8735cfd..139ea17 100644
+--- a/inventory_app/README.md
++++ b/inventory_app/README.md
+@@ -16,6 +16,10 @@ flask seed                         # 初期カテゴリー(Tシャツ/キャッ
+ flask create-user 管理者名 --admin  # 最初の管理者(パスワードを聞かれます)
+ ```
+ 
++アプリを更新したら `flask init-db` をもう一度実行してください(何度実行しても安全です)。
++未実行のままアクセスすると、「データベースの更新が必要です」(503)と表示されます。
++実行すれば、再起動しなくても使えるようになります。
++
+ ## 起動
+ 
+ 開発(自分のPCだけ):
+diff --git a/inventory_app/app/__init__.py b/inventory_app/app/__init__.py
+index d04c06b..cf0b43e 100644
+--- a/inventory_app/app/__init__.py
++++ b/inventory_app/app/__init__.py
+@@ -3,7 +3,7 @@ import sqlite3
+ from datetime import datetime, timedelta, timezone
+ 
+ import click
+-from flask import Flask, render_template
++from flask import Flask, Response, render_template, request
+ from flask_login import LoginManager
+ from flask_wtf.csrf import CSRFError, CSRFProtect
+ 
+@@ -16,6 +16,15 @@ login_manager.login_message_category = "warning"
+ 
+ JST = timezone(timedelta(hours=9))
+ 
++_SCHEMA_PAGE = """<!doctype html>
++<html lang="ja"><head><meta charset="utf-8">
++<meta name="viewport" content="width=device-width, initial-scale=1"><title>準備中</title></head>
++<body style="font-family:sans-serif;max-width:32rem;margin:3rem auto;padding:0 1rem">
++<h1 style="font-size:1.3rem">データベースの更新が必要です</h1>
++<p>管理者に連絡してください。</p>
++<p style="color:#666;font-size:.9rem">(管理者向け: サーバーで <code>flask init-db</code> を実行すると、再起動なしで使えるようになります)</p>
++</body></html>"""
++
+ 
+ def create_app(config_object="config.Config"):
+     app = Flask(__name__)
+@@ -24,12 +33,15 @@ def create_app(config_object="config.Config"):
+         config_object = import_string(config_object)
+     app.config.from_object(config_object)
+ 
++    from .utils import BoundedIntegerConverter
++    app.url_map.converters["int"] = BoundedIntegerConverter  # blueprint登録より前に差し替える
++
+     if app.config.get("BEHIND_PROXY"):
+         from werkzeug.middleware.proxy_fix import ProxyFix
+         app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+ 
+     from . import repo
+-    from .db import close_db
++    from .db import close_db, get_db
+ 
+     app.teardown_appcontext(close_db)
+     login_manager.init_app(app)
+@@ -70,6 +82,23 @@ def create_app(config_object="config.Config"):
+     def server_error(_):
+         return error_page(500, "エラーが起きました。管理者に連絡してください。")
+ 
++    @app.before_request
++    def require_current_schema():
++        """DBが未作成/古いままだと、画面を開いて初めて500になる。先に分かりやすく止める。"""
++        if app.extensions.get("schema_ok") or request.endpoint == "static":
++            return None
++        from .schema import is_current
++        path = app.config["DATABASE"]
++        # 存在しないファイルに get_db() すると、空のDBが勝手に作られてしまうので先に確かめる
++        if os.path.exists(path) and is_current(get_db()):
++            app.extensions["schema_ok"] = True  # 更新が済めば、それ以降は確認しない
++            return None
++        if not app.extensions.get("schema_warned"):
++            app.extensions["schema_warned"] = True
++            app.logger.error("DBが未作成か古いバージョンです。`flask init-db` を実行してください: %s", path)
++        return Response(_SCHEMA_PAGE, 503, content_type="text/html; charset=utf-8",
++                        headers={"Retry-After": "60"})
++
+     @app.after_request
+     def no_cache(resp):
+         # 在庫は常に最新を見せたいので、HTMLはキャッシュさせない
+diff --git a/inventory_app/app/inventory/routes.py b/inventory_app/app/inventory/routes.py
+index 19b8d77..e7b46fa 100644
+--- a/inventory_app/app/inventory/routes.py
++++ b/inventory_app/app/inventory/routes.py
+@@ -164,7 +164,7 @@ def move():
+ 
+ @bp.route("/history")
+ def history():
+-    page = max(to_int(request.args.get("page"), 1), 1)
++    page = min(max(to_int(request.args.get("page"), 1), 1), 100_000)  # OFFSET の計算が溢れないように
+     kind = request.args.get("kind", "")
+     pagination = repo.movements_page(kind, page, current_app.config["HISTORY_PER_PAGE"])
+     return render_template("inventory/history.html", pagination=pagination, kind=kind, kinds=KINDS)
+diff --git a/inventory_app/app/repo.py b/inventory_app/app/repo.py
+index fbc2837..9656bc7 100644
+--- a/inventory_app/app/repo.py
++++ b/inventory_app/app/repo.py
+@@ -3,6 +3,7 @@ import hmac
+ 
+ from .db import get_db
+ from .models import KINDS, User
++from .utils import to_int
+ 
+ 
+ def _all(sql, args=()):
+@@ -204,9 +205,8 @@ def designs():
+ def get_target(raw):
+     """フォームの 'v:12' / 'p:34' から在庫の行を引く。"""
+     kind, _, rid = (raw or "").partition(":")
+-    try:
+-        rid = int(rid)
+-    except ValueError:
++    rid = to_int(rid)
++    if rid is None:
+         return None
+     if kind == "v":
+         return get_variant(rid)
+diff --git a/inventory_app/app/schema.py b/inventory_app/app/schema.py
+index b4cfa12..5a20a7a 100644
+--- a/inventory_app/app/schema.py
++++ b/inventory_app/app/schema.py
+@@ -95,6 +95,11 @@ def current_version(db) -> int:
+     return db.execute("PRAGMA user_version").fetchone()["user_version"]
+ 
+ 
++def is_current(db) -> bool:
++    """DBが最新のスキーマか。"""
++    return current_version(db) >= len(MIGRATIONS)
++
++
+ def migrate(db) -> int:
+     v = current_version(db)
+     has_tables = db.execute(
+diff --git a/inventory_app/app/services/stock.py b/inventory_app/app/services/stock.py
+index 83e3017..f7df531 100644
+--- a/inventory_app/app/services/stock.py
++++ b/inventory_app/app/services/stock.py
+@@ -8,6 +8,7 @@ import uuid
+ 
+ from .. import repo
+ from ..db import get_db
++from ..utils import MAX_QTY
+ 
+ _TABLE = {"variant": "variant", "product": "printed_product"}
+ 
+@@ -41,6 +42,8 @@ def _log(batch_id, kind, user, delta, note, target):
+ def _positive(n, label="数量") -> int:
+     if not isinstance(n, int) or n <= 0:
+         raise StockError(f"{label}は1以上の整数で入力してください。")
++    if n > MAX_QTY:
++        raise StockError(f"{label}は{MAX_QTY:,}以下で入力してください。")
+     return n
+ 
+ 
+@@ -109,6 +112,8 @@ def adjust(user, target, delta: int, note: str) -> str:
+     """棚卸し調整。増減どちらも可。理由(note)は必須。"""
+     if not isinstance(delta, int) or delta == 0:
+         raise StockError("増減数は0以外の整数で入力してください。")
++    if abs(delta) > MAX_QTY:
++        raise StockError(f"増減数は{MAX_QTY:,}以下で入力してください。")
+     if not _norm(note):
+         raise StockError("棚卸し調整には理由を入力してください。")
+     batch = str(uuid.uuid4())
+diff --git a/inventory_app/app/utils.py b/inventory_app/app/utils.py
+index 4263338..4baeaa8 100644
+--- a/inventory_app/app/utils.py
++++ b/inventory_app/app/utils.py
+@@ -1,5 +1,11 @@
+ from urllib.parse import urlparse
+ 
++from werkzeug.routing import IntegerConverter
++
++INT64_MAX = 2**63 - 1   # SQLite の整数の上限。これを超える値を渡すと OverflowError になる
++MAX_QTY = 1_000_000     # 1回の入荷・出荷・調整の上限。SQLite は整数の足し算が溢れると、
++                        # エラーにせず REAL(小数)にしてしまうので、在庫列を守るためにも必要
++
+ SIZE_ORDER = ["XXS", "XS", "S", "M", "L", "XL", "2XL", "XXL", "3XL", "XXXL", "4XL", "5XL",
+               "FREE", "F"]
+ 
+@@ -14,11 +20,20 @@ def size_key(s):
+ 
+ 
+ def to_int(raw, default=None):
+-    """フォーム/クエリの文字列を整数にする。変換できなければ default を返す(例外は出さない)。"""
++    """フォーム/クエリの文字列を整数にする。変換できない/SQLiteの整数範囲外なら default(例外は出さない)。"""
+     try:
+-        return int((raw or "").strip())
++        n = int((raw or "").strip())
+     except (ValueError, AttributeError):
+         return default
++    return n if -INT64_MAX <= n <= INT64_MAX else default
++
++
++class BoundedIntegerConverter(IntegerConverter):
++    """URLの <int:x> を SQLite の整数範囲に制限する(範囲外はルートに一致せず 404)。"""
++
++    def __init__(self, map, **kwargs):
++        kwargs.setdefault("max", INT64_MAX)
++        super().__init__(map, **kwargs)
+ 
+ 
+ def safe_next(target):
+diff --git a/inventory_app/tests/test_robustness.py b/inventory_app/tests/test_robustness.py
+new file mode 100644
+index 0000000..d846ab6
+--- /dev/null
++++ b/inventory_app/tests/test_robustness.py
+@@ -0,0 +1,127 @@
++"""不正な入力(巨大な整数)・数量の上限・DBスキーマが古い場合の挙動。"""
++import os
++
++import pytest
++
++from app import create_app
++from app.db import get_db, transaction
++from app.schema import MIGRATIONS, migrate
++from config import TestConfig
++
++BIG = "9" * 30          # SQLite の整数(64bit)に入らない値
++INT64_MAX = 2**63 - 1   # 入るが、足し算でオーバーフローする値
++
++
++def _quantity(app, variant_id=1):
++    with app.app_context():
++        return get_db().execute(
++            "SELECT quantity, typeof(quantity) AS t FROM variant WHERE id = ?", (variant_id,)).fetchone()
++
++
++# ---- 巨大な整数で500にならない -------------------------------------------------
++
++@pytest.mark.parametrize("path, want", [
++    (f"/receive?item_id={BIG}", 200),
++    (f"/history?page={BIG}", 200),
++    (f"/history?page={2**62}", 200),          # 64bitには入るが、OFFSET の計算で溢れる値
++    (f"/blank?category={BIG}", 200),
++    (f"/admin/items?category={BIG}", 200),
++    (f"/admin/items/{BIG}", 404),             # URL中の <int:...>
++    (f"/admin/categories/{BIG}", 404),
++])
++def test_get_with_huge_numbers_does_not_crash(client, login, path, want):
++    login("admin")
++    assert client.get(path).status_code == want
++
++
++@pytest.mark.parametrize("path, data, want", [
++    ("/receive", {"item_id": "1", "color": "赤", "size": "M", "qty": BIG}, 200),
++    ("/receive", {"item_id": BIG, "color": "赤", "size": "M", "qty": "1"}, 200),
++    ("/convert", {"variant_id": BIG, "used": "1", "output": "1", "design": "x"}, 200),
++    ("/move", {"target": f"v:{BIG}", "kind": "ship", "qty": "1"}, 200),
++    ("/move", {"target": f"p:{BIG}", "kind": "ship", "qty": "1"}, 200),
++    ("/notes", {"item_id": BIG, "body": "x"}, 302),
++    (f"/notes/{BIG}/resolve", {}, 404),
++    ("/admin/categories/1", {"name": "Tシャツ", "sort_order": BIG}, 200),
++    ("/admin/items", {"category_id": BIG, "brand": "x"}, 200),
++    (f"/admin/users/{BIG}/toggle", {}, 404),
++])
++def test_post_with_huge_numbers_does_not_crash(client, login, path, data, want):
++    login("admin")
++    assert client.post(path, data=data).status_code == want
++
++
++def test_huge_receive_leaves_no_variant_behind(app, client, login):
++    login("admin")
++    client.post("/receive", data={"item_id": "1", "color": "赤", "size": "M", "qty": BIG})
++    with app.app_context():
++        assert get_db().execute("SELECT COUNT(*) AS n FROM variant").fetchone()["n"] == 0
++
++
++# ---- 数量の上限(SQLiteは整数の足し算が溢れると、エラーにせず REAL にしてしまう) ---------
++
++def _receive(client, qty, color="赤"):
++    return client.post("/receive", data={"item_id": "1", "color": color, "size": "M", "qty": str(qty)},
++                       follow_redirects=True)
++
++
++def test_quantity_stays_integer_even_when_a_huge_qty_is_sent(app, client, login):
++    login("admin")
++    _receive(client, 5)
++    r = _receive(client, INT64_MAX)
++    assert "1,000,000以下" in r.get_data(as_text=True)
++    assert dict(_quantity(app)) == {"quantity": 5, "t": "integer"}
++
++
++def test_per_operation_limit_is_enforced_everywhere(app, client, login):
++    from app.utils import MAX_QTY
++    login("admin")
++    assert _receive(client, MAX_QTY + 1).status_code == 200
++    assert _quantity(app) is None                               # 上限超えは登録されない
++    _receive(client, MAX_QTY)
++    assert dict(_quantity(app)) == {"quantity": MAX_QTY, "t": "integer"}
++    for kind, qty in (("ship", MAX_QTY + 1), ("adjust", MAX_QTY + 1), ("adjust", -(MAX_QTY + 1))):
++        r = client.post("/move", data={"target": "v:1", "kind": kind, "qty": str(qty), "note": "x"},
++                        follow_redirects=True)
++        assert "1,000,000以下" in r.get_data(as_text=True), (kind, qty)
++    assert dict(_quantity(app)) == {"quantity": MAX_QTY, "t": "integer"}
++    r = client.post("/convert", data={"variant_id": "1", "used": str(MAX_QTY + 1), "output": "1", "design": "x"},
++                    follow_redirects=True)
++    assert "1,000,000以下" in r.get_data(as_text=True)
++
++
++# ---- DBが未作成/古いままでも、500ではなく分かりやすく案内する ------------------------
++
++def _bare_app(tmp_path):
++    class Cfg(TestConfig):
++        DATABASE = str(tmp_path / "bare.db")
++    return create_app(Cfg), Cfg.DATABASE
++
++
++def test_missing_db_gives_503_and_does_not_create_the_file(tmp_path):
++    app, path = _bare_app(tmp_path)
++    c = app.test_client()
++    r = c.get("/login")
++    assert r.status_code == 503 and "flask init-db" in r.get_data(as_text=True)
++    assert not os.path.exists(path)
++    assert c.get("/static/app.css").status_code == 200       # 静的ファイルは止めない
++
++
++def test_outdated_schema_gives_503_then_recovers_after_migration_without_restart(tmp_path):
++    app, path = _bare_app(tmp_path)
++    with app.app_context():
++        db = get_db()
++        db.executescript(MIGRATIONS[0])
++        db.execute("PRAGMA user_version=1")                  # 備考テーブルが無い古い状態
++    c = app.test_client()
++    assert c.get("/login").status_code == 503
++    with app.app_context():
++        migrate(get_db())                                    # 別プロセスで init-db した想定
++    assert c.get("/login").status_code == 200
++
++
++def test_init_db_cli_still_works_on_missing_db(tmp_path):
++    app, path = _bare_app(tmp_path)
++    r = app.test_cli_runner().invoke(args=["init-db"])
++    assert r.exit_code == 0 and os.path.exists(path)
++    assert app.test_client().get("/login").status_code == 200
