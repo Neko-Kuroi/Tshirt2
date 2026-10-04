@@ -72,6 +72,22 @@ CREATE TABLE stock_movement (
 CREATE INDEX ix_stock_movement_batch_id ON stock_movement(batch_id);
 CREATE INDEX ix_stock_movement_created_at ON stock_movement(created_at);
 """,
+    # 2: 品番ごとの備考(コメント)。旧 item.note の内容は備考として引き継ぐ
+    """
+CREATE TABLE item_note (
+  id INTEGER PRIMARY KEY,
+  item_id INTEGER NOT NULL REFERENCES item(id),
+  target TEXT NOT NULL DEFAULT '',
+  body TEXT NOT NULL,
+  is_resolved INTEGER NOT NULL DEFAULT 0,
+  user_id INTEGER NOT NULL REFERENCES "user"(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX ix_item_note_item_id ON item_note(item_id);
+INSERT INTO item_note (item_id, body, user_id)
+  SELECT id, note, (SELECT MIN(id) FROM "user") FROM item
+  WHERE note <> '' AND EXISTS (SELECT 1 FROM "user");
+""",
 ]
 
 
@@ -87,5 +103,10 @@ def migrate(db) -> int:
         db.execute("PRAGMA user_version=1")
         v = 1
     for n, sql in enumerate(MIGRATIONS[v:], start=v + 1):
-        db.executescript(f"BEGIN;\n{sql}\nPRAGMA user_version={n};\nCOMMIT;")
+        try:
+            db.executescript(f"BEGIN;\n{sql}\nPRAGMA user_version={n};\nCOMMIT;")
+        except BaseException:
+            if db.in_transaction:  # 途中で失敗したら、そのバージョンの変更を全部取り消す
+                db.execute("ROLLBACK")
+            raise
     return current_version(db)

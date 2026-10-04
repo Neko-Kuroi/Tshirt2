@@ -191,13 +191,22 @@ def test_concurrent_ship_never_goes_negative(app):
 
 # ---- マイグレーション ------------------------------------------------------------
 
-def test_migrate_is_idempotent_and_adopts_legacy_db(app):
+def test_migrate_is_idempotent(app):
     db = get_db()
     assert current_version(db) == len(MIGRATIONS)
     assert migrate(db) == len(MIGRATIONS)  # 2回目は何もしない
-    db.execute("PRAGMA user_version=0")  # SQLAlchemy+Alembic時代のDB(user_version未設定)を再現
-    assert migrate(db) == len(MIGRATIONS)
     assert _rows("SELECT COUNT(*) AS n FROM item")[0]["n"] == 3  # データは無傷
+
+
+def test_failed_migration_is_rolled_back_completely(app, monkeypatch):
+    bad = "CREATE TABLE half_done (id INTEGER); INSERT INTO no_such_table VALUES (1);"
+    monkeypatch.setattr("app.schema.MIGRATIONS", MIGRATIONS + [bad])
+    db = get_db()
+    with pytest.raises(Exception):
+        migrate(db)
+    assert not db.in_transaction  # BEGIN のまま残らない
+    assert current_version(db) == len(MIGRATIONS)
+    assert not _rows("SELECT 1 FROM sqlite_master WHERE name = 'half_done'")  # 途中までの変更も無い
 
 
 def test_foreign_keys_and_checks_are_enforced(app):

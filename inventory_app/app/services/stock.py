@@ -32,8 +32,8 @@ def _apply(kind: str, row_id: int, delta: int):
 def _log(batch_id, kind, user, delta, note, target):
     is_variant = target["kind"] == "variant"
     get_db().execute(
-        "INSERT INTO stock_movement (batch_id, kind, variant_id, printed_product_id, delta, note, user_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO stock_movement (batch_id, kind, variant_id, printed_product_id, delta, note, "
+        "user_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))",
         (batch_id, kind, target["id"] if is_variant else None,
          None if is_variant else target["id"], delta, _norm(note), user.id))
 
@@ -46,6 +46,8 @@ def _positive(n, label="数量") -> int:
 
 def get_or_create_variant(item, color="", size="", variant_name=""):
     """item は repo.get_item の行。カテゴリー設定に合わない列は空文字に落として登録する。"""
+    if not item["is_active"]:
+        raise StockError("この品番は使用停止中のため、入荷できません。")
     color = _norm(color) if item["uses_color"] else ""
     size = _norm(size) if item["uses_size"] else ""
     variant_name = _norm(variant_name) if item["uses_variant_name"] else ""
@@ -59,7 +61,8 @@ def get_or_create_variant(item, color="", size="", variant_name=""):
     if v:
         return v
     cur = get_db().execute(
-        "INSERT INTO variant (item_id, color, size, variant_name) VALUES (?, ?, ?, ?)",
+        "INSERT INTO variant (item_id, color, size, variant_name, quantity, updated_at) "
+        "VALUES (?, ?, ?, ?, 0, datetime('now'))",
         (item["id"], color, size, variant_name))
     return repo.get_variant(cur.lastrowid)
 
@@ -70,7 +73,7 @@ def get_or_create_design(name: str) -> int:
         raise StockError("デザイン名を入力してください。")
     db = get_db()
     row = db.execute("SELECT id FROM design WHERE name = ?", (name,)).fetchone()
-    return row["id"] if row else db.execute("INSERT INTO design (name) VALUES (?)", (name,)).lastrowid
+    return row["id"] if row else db.execute("INSERT INTO design (name, note) VALUES (?, '')", (name,)).lastrowid
 
 
 def get_or_create_product(design_id: int, variant_id: int):
@@ -78,7 +81,8 @@ def get_or_create_product(design_id: int, variant_id: int):
     row = db.execute("SELECT id FROM printed_product WHERE design_id = ? AND variant_id = ?",
                      (design_id, variant_id)).fetchone()
     pid = row["id"] if row else db.execute(
-        "INSERT INTO printed_product (design_id, variant_id) VALUES (?, ?)",
+        "INSERT INTO printed_product (design_id, variant_id, quantity, updated_at) "
+        "VALUES (?, ?, 0, datetime('now'))",
         (design_id, variant_id)).lastrowid
     return repo.get_product(pid)
 
@@ -122,6 +126,8 @@ def convert_to_printed(user, variant, design_name: str, used: int, output: int, 
         raise StockError("完成数が使用数を超えています。")
     if not variant["is_printable"]:
         raise StockError("このカテゴリーはプリント対象ではありません。")
+    if not variant["item_active"]:
+        raise StockError("この品番は使用停止中のため、プリント変換できません。")
 
     design_id = get_or_create_design(design_name)
     batch = str(uuid.uuid4())

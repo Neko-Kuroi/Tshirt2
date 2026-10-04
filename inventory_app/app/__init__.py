@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import click
 from flask import Flask, render_template
 from flask_login import LoginManager
-from flask_wtf.csrf import CSRFProtect
+from flask_wtf.csrf import CSRFError, CSRFProtect
 
 login_manager = LoginManager()
 csrf = CSRFProtect()
@@ -33,7 +33,7 @@ def create_app(config_object="config.Config"):
 
     app.teardown_appcontext(close_db)
     login_manager.init_app(app)
-    login_manager.user_loader(repo.get_user)
+    login_manager.user_loader(repo.load_session_user)
     csrf.init_app(app)
 
     from .admin import bp as admin_bp
@@ -44,9 +44,31 @@ def create_app(config_object="config.Config"):
     app.register_blueprint(inventory_bp)
     app.register_blueprint(admin_bp, url_prefix="/admin")
 
+    def error_page(code, message):
+        return render_template("error.html", code=code, message=message), code
+
     @app.errorhandler(404)
     def not_found(_):
-        return render_template("error.html", code=404, message="ページが見つかりません。"), 404
+        return error_page(404, "ページが見つかりません。")
+
+    @app.errorhandler(403)
+    def forbidden(_):
+        return error_page(403, "この操作をする権限がありません。")
+
+    @app.errorhandler(CSRFError)
+    def csrf_failed(_):
+        return error_page(400, "画面の有効期限が切れたか、不正な送信です。ページを開き直して、もう一度お試しください。")
+
+    @app.errorhandler(sqlite3.OperationalError)
+    def db_busy(e):
+        app.logger.exception("database error")
+        if "locked" in str(e) or "busy" in str(e):
+            return error_page(503, "ただいま混み合っています。数秒おいて、もう一度お試しください。")
+        return error_page(500, "データベースでエラーが起きました。管理者に連絡してください。")
+
+    @app.errorhandler(500)
+    def server_error(_):
+        return error_page(500, "エラーが起きました。管理者に連絡してください。")
 
     @app.after_request
     def no_cache(resp):
@@ -74,6 +96,7 @@ def register_cli(app):
 
     from .db import get_db, transaction
     from .schema import migrate
+    from .utils import is_unique_violation
 
     @app.cli.command("init-db")
     def init_db():
@@ -112,8 +135,11 @@ def register_cli(app):
         role = "admin" if admin else "staff"
         try:
             with transaction() as db:
-                db.execute('INSERT INTO "user" (username, password_hash, role) VALUES (?, ?, ?)',
+                db.execute('INSERT INTO "user" (username, password_hash, role, is_active, created_at) '
+                           "VALUES (?, ?, ?, 1, datetime('now'))",
                            (username, generate_password_hash(password), role))
-        except sqlite3.IntegrityError:
+        except sqlite3.IntegrityError as e:
+            if not is_unique_violation(e):
+                raise
             raise click.ClickException("そのユーザー名は既に使われています。")
         click.echo(f"作成しました: {username} ({role})")

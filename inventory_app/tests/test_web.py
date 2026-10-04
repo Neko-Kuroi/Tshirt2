@@ -135,6 +135,8 @@ def _seed_printed(n, start):
             v = stock.get_or_create_variant(repo.get_item(item_id), "黒", "M")
             stock.receive(admin, v, 10)
             stock.convert_to_printed(admin, v, f"Design{i}", 5, 5)
+            db.execute("INSERT INTO item_note (item_id, target, body, user_id) VALUES (?, '黒', ?, ?)",
+                       (item_id, f"備考{i}", admin.id))
 
 
 def _count_queries(client, path, monkeypatch):
@@ -152,7 +154,7 @@ def _count_queries(client, path, monkeypatch):
     return len(statements)
 
 
-@pytest.mark.parametrize("path", ["/", "/blank?category=1", "/printed", "/convert", "/move", "/history"])
+@pytest.mark.parametrize("path", ["/", "/blank?category=1", "/printed", "/convert", "/move", "/history", "/notes"])
 def test_query_count_does_not_grow_with_rows(client, login, monkeypatch, path):
     login("admin")
     _seed_printed(3, 0)

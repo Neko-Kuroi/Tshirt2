@@ -1,8 +1,15 @@
 {% extends "base.html" %}
 {% from "_macros.html" import csrf, qty_input %}
+{% from "_notes.html" import note_list, note_form %}
 {% block title %}入荷 | 在庫管理{% endblock %}
 {% block content %}
 <h1 class="page-title">入荷登録</h1>
+{% if selected and item_notes %}
+<div class="panel mb-3" style="max-width:560px">
+  <div class="fw-bold mb-2">この品番の備考(未対応)</div>
+  {{ note_list(item_notes, request.full_path, current_user.is_admin) }}
+</div>
+{% endif %}
 <form method="post" class="panel d-grid gap-3" style="max-width:560px">
   {{ csrf() }}
   <div>

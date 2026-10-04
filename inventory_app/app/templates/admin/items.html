@@ -28,8 +28,9 @@
   </select>
   <input class="form-control" name="brand" placeholder="ブランド(例: Printstar)">
   <input class="form-control" name="item_no" placeholder="品番(例: 085-CVT)">
-  <input class="form-control" name="name" placeholder="商品名(例: ヘビーウェイトTシャツ)">
-  <input class="form-control" name="note" placeholder="メモ">
+  <div class="form-text mt-0">ブランドか品番のどちらかは必須です。</div>
+  <input class="form-control" name="name" placeholder="商品名(任意。例: ヘビーウェイトTシャツ)">
+  <div class="form-text mt-0">仕入れ先の変更や「入荷は最後」などのメモは、登録後に無地在庫の画面から「備考」として残せます。</div>
   <button class="btn btn-primary">追加</button>
 </form>
 {% endblock %}

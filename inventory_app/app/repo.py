@@ -1,4 +1,6 @@
 """読み取り用クエリ集。テンプレートで使う表示用の項目(label, spec など)もここで付ける。"""
+import hmac
+
 from .db import get_db
 from .models import KINDS, User
 
@@ -12,8 +14,9 @@ def _one(sql, args=()):
 
 
 def item_label(r):
+    """r は brand / item_no / item_name / item_id を持つ行。"""
     head = " ".join(p for p in (r["brand"], r["item_no"]) if p)
-    return f"{head} {r['item_name']}".strip() or f"Item#{r.get('item_id', r.get('id'))}"
+    return f"{head} {r['item_name']}".strip() or f"Item#{r['item_id']}"
 
 
 def spec_of(r):
@@ -25,6 +28,15 @@ def spec_of(r):
 def get_user(user_id):
     row = _one('SELECT * FROM "user" WHERE id = ?', (user_id,))
     return User(row) if row else None
+
+
+def load_session_user(session_id):
+    """Flask-Login 用。'ユーザーID:トークン' が一致しなければ(パスワード変更後など)None。"""
+    uid, _, token = (session_id or "").partition(":")
+    user = get_user(int(uid)) if uid.isdigit() else None
+    if user and hmac.compare_digest(token, user.session_token()):
+        return user
+    return None
 
 
 def get_user_by_name(username):
@@ -49,7 +61,7 @@ def get_category(cid):
 # ---- 品番 ------------------------------------------------------------
 
 _ITEM = """
-SELECT i.id, i.category_id, i.brand, i.item_no, i.name AS item_name, i.note, i.is_active,
+SELECT i.id, i.id AS item_id, i.category_id, i.brand, i.item_no, i.name AS item_name, i.is_active,
        c.name AS category_name, c.uses_color, c.uses_size, c.uses_variant_name, c.is_printable
 FROM item i JOIN category c ON c.id = i.category_id
 """
@@ -119,6 +131,11 @@ def find_variant(item_id, color, size, variant_name):
         (item_id, color, size, variant_name)))
 
 
+def variants_of_item(item_id):
+    return [_variant(r) for r in _all(
+        _VARIANT + " WHERE v.item_id = ? ORDER BY v.variant_name, v.color", (item_id,))]
+
+
 def variants_in_category(category_id):
     return [_variant(r) for r in _all(
         _VARIANT + " WHERE i.category_id = ? ORDER BY v.variant_name, v.color", (category_id,))]
@@ -148,7 +165,7 @@ def used_colors():
 _PRODUCT = """
 SELECT p.id, p.design_id, p.variant_id, p.quantity, d.name AS design_name,
        v.color, v.size, v.variant_name,
-       i.brand, i.item_no, i.name AS item_name, c.name AS category_name
+       i.id AS item_id, i.brand, i.item_no, i.name AS item_name, c.name AS category_name
 FROM printed_product p
 JOIN design d ON d.id = p.design_id
 JOIN variant v ON v.id = p.variant_id
@@ -259,3 +276,45 @@ def movements_page(kind, page, per_page):
     sql += " ORDER BY m.created_at DESC, m.id DESC LIMIT ? OFFSET ?"
     rows = _all(sql, args + [per_page + 1, (page - 1) * per_page])
     return Page([_movement(r) for r in rows[:per_page]], page, len(rows) > per_page)
+
+
+# ---- 備考(item_note) ---------------------------------------------------
+
+_NOTE = """
+SELECT n.id, n.item_id, n.target, n.body, n.is_resolved, n.created_at, u.username,
+       i.brand, i.item_no, i.name AS item_name, i.category_id, c.name AS category_name
+FROM item_note n
+JOIN "user" u ON u.id = n.user_id
+JOIN item i ON i.id = n.item_id
+JOIN category c ON c.id = i.category_id
+"""
+
+
+def _note(r):
+    r["item_label"] = item_label(r)
+    return r
+
+
+def notes(include_resolved=False, item_id=None, category_id=None, limit=None):
+    sql, args = _NOTE + " WHERE 1=1", []
+    if not include_resolved:
+        sql += " AND n.is_resolved = 0"
+    if item_id:
+        sql += " AND n.item_id = ?"
+        args.append(item_id)
+    if category_id:
+        sql += " AND i.category_id = ?"
+        args.append(category_id)
+    sql += " ORDER BY n.is_resolved, n.created_at DESC, n.id DESC"
+    if limit:
+        sql += " LIMIT ?"
+        args.append(limit)
+    return [_note(r) for r in _all(sql, args)]
+
+
+def get_note(note_id):
+    return _one("SELECT id, item_id FROM item_note WHERE id = ?", (note_id,))
+
+
+def open_note_count():
+    return _one("SELECT COUNT(*) AS n FROM item_note WHERE is_resolved = 0")["n"]
