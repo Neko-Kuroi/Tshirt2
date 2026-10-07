@@ -1,4 +1,4 @@
-"""旧版(SQLAlchemy + Alembic)DBの引き継ぎと、レビュー指摘の回帰テスト。"""
+"""SQLAlchemy 版で作ったDBの引き継ぎと、レビュー指摘の回帰テスト。"""
 import re
 import sqlite3
 from pathlib import Path
@@ -13,28 +13,29 @@ from app.schema import MIGRATIONS, migrate
 from app.services import stock
 from config import TestConfig
 
-LEGACY_DDL = (Path(__file__).parent / "legacy_schema.sql").read_text(encoding="utf-8")
-LEGACY_TS = "2026-10-04 00:20:10.887356"  # SQLAlchemy が書いていた(マイクロ秒付き)形式
+SQLALCHEMY_DDL = (Path(__file__).parent / "sqlalchemy_version_schema.sql").read_text(encoding="utf-8")
+SQLALCHEMY_TS = "2026-10-04 00:20:10.887356"  # SQLAlchemy が書いていた(マイクロ秒付き)形式
 
 
-# ---- 旧DBの再現(旧版が実際に作ったDDL + 旧版が書いた形式のデータ) -------------------
+# ---- SQLAlchemy 版が作ったDBの再現(実際に作ったDDL + 実際に書いた形式のデータ) ---------------
 
 @pytest.fixture
-def legacy_app(tmp_path):
-    path = str(tmp_path / "legacy.db")
+def sqlalchemy_made_app(tmp_path):
+    path = str(tmp_path / "sqlalchemy_made.db")
     raw = sqlite3.connect(path)
-    raw.executescript(LEGACY_DDL)
+    raw.executescript(SQLALCHEMY_DDL)
     raw.executescript(f"""
     INSERT INTO category VALUES (1,'Tシャツ',0,1,1,0,1), (2,'バッジ',1,0,0,1,0);
     INSERT INTO item VALUES (1,1,'Printstar','085-CVT','Tシャツ','旧メモ: 色違いを探す',1),
                             (2,2,'','44mm','缶バッジ','',1);
-    INSERT INTO variant VALUES (1,1,'黒','M','',10,'{LEGACY_TS}');
+    INSERT INTO variant VALUES (1,1,'黒','M','',10,'{SQLALCHEMY_TS}');
     INSERT INTO design VALUES (1,'ロゴA','');
-    INSERT INTO printed_product VALUES (1,1,1,9,'{LEGACY_TS}');
+    INSERT INTO printed_product VALUES (1,1,1,9,'{SQLALCHEMY_TS}');
     """)
+    raw.execute("INSERT INTO alembic_version VALUES ('afd0c4cd0c7c')")  # SQLAlchemy 版が記録していたリビジョン
     raw.execute('INSERT INTO "user" VALUES (1,?,?,?,1,?)',
-                ("neko", generate_password_hash("pass12345"), "admin", LEGACY_TS))
-    raw.execute("INSERT INTO stock_movement VALUES (1,'b1','receive',1,NULL,20,'旧版で入荷',1,?)", (LEGACY_TS,))
+                ("neko", generate_password_hash("pass12345"), "admin", SQLALCHEMY_TS))
+    raw.execute("INSERT INTO stock_movement VALUES (1,'b1','receive',1,NULL,20,'SQLAlchemy版で入荷',1,?)", (SQLALCHEMY_TS,))
     raw.commit()
     raw.close()
 
@@ -57,7 +58,7 @@ def _login(app, username="neko", password="pass12345"):
     return c
 
 
-def test_legacy_db_is_adopted_and_old_note_is_kept(legacy_app):
+def test_sqlalchemy_db_is_adopted_and_old_note_is_kept(sqlalchemy_made_app):
     db = get_db()
     assert db.execute("PRAGMA user_version").fetchone()["user_version"] == len(MIGRATIONS)
     (n,) = repo.notes(include_resolved=True)
@@ -65,17 +66,17 @@ def test_legacy_db_is_adopted_and_old_note_is_kept(legacy_app):
     assert repo.get_variant(1)["quantity"] == 10  # 既存データは無傷
 
 
-def test_legacy_db_all_pages_render(legacy_app):
-    c = _login(legacy_app)
+def test_sqlalchemy_db_all_pages_render(sqlalchemy_made_app):
+    c = _login(sqlalchemy_made_app)
     for path in ["/", "/blank", "/printed", "/receive?item_id=1", "/convert", "/move", "/history",
                  "/notes", "/admin/items", "/admin/categories", "/admin/users"]:
         assert c.get(path).status_code == 200, path
     assert "10/04 09:20" in c.get("/history").get_data(as_text=True)  # UTC 00:20 → JST 09:20
 
 
-def test_legacy_db_every_write_path_works(legacy_app):
-    """旧DBには DEFAULT が無い。新コードの INSERT がそれに頼っていないことの確認。"""
-    c = _login(legacy_app)
+def test_sqlalchemy_db_every_write_path_works(sqlalchemy_made_app):
+    """SQLAlchemy 版が作ったDBには DEFAULT が無い。この版の INSERT がそれに頼っていないことの確認。"""
+    c = _login(sqlalchemy_made_app)
     assert c.post("/receive", data={"item_id": 1, "color": "黒", "size": "M", "qty": "5"}).status_code == 302
     assert c.post("/receive", data={"item_id": 1, "color": "白", "size": "L", "qty": "7"}).status_code == 302  # 新Variant
     assert c.post("/convert", data={"variant_id": 1, "design_new": "新デザイン", "used": "4", "output": "4"}).status_code == 302
@@ -119,7 +120,7 @@ def test_item_edit_cannot_blank_out_identity(client, login):
 
 
 def test_item_label_fallback_uses_item_id_not_row_id(app):
-    with transaction() as db:  # 旧データなどで、全項目が空の品番
+    with transaction() as db:  # 以前のデータなどで、全項目が空の品番
         iid = db.execute("INSERT INTO item (category_id, brand, item_no, name, note, is_active) "
                          "VALUES (1, '', '', '', '', 1)").lastrowid
         admin = repo.get_user_by_name("admin")
@@ -299,3 +300,51 @@ def test_notes_validation_permissions_and_escaping(client, login):
     assert client.post(f"/notes/{nid}/delete", data={}).status_code == 302
     assert nid not in [n["id"] for n in repo.notes(include_resolved=True)]
     assert client.post("/notes/99999/resolve", data={}).status_code == 404
+
+
+# ---- SQLAlchemy 版がリビジョン2まで進めたDB(備考テーブルあり)も引き継げる ----------
+
+def test_sqlalchemy_db_already_at_revision_2_is_adopted(tmp_path):
+    path = str(tmp_path / "rev2.db")
+    raw = sqlite3.connect(path)
+    raw.executescript(SQLALCHEMY_DDL)
+    raw.executescript("""
+    CREATE TABLE item_note (id INTEGER NOT NULL PRIMARY KEY, item_id INTEGER NOT NULL, target VARCHAR(64) NOT NULL,
+      body TEXT NOT NULL, is_resolved BOOLEAN NOT NULL, user_id INTEGER NOT NULL, created_at DATETIME NOT NULL);
+    INSERT INTO category VALUES (1,'Tシャツ',0,1,1,0,1);
+    """)
+    raw.execute("INSERT INTO alembic_version VALUES ('0002itemnote')")
+    raw.commit()
+    raw.close()
+
+    class Cfg(TestConfig):
+        DATABASE = path
+
+    app = create_app(Cfg)
+    with app.app_context():
+        assert migrate(get_db()) == len(MIGRATIONS)  # 「item_note は既にある」で落ちない
+        # SQLAlchemy 版が作った item_note には DEFAULT が無い。この版の INSERT は全列を指定するので書ける
+        with transaction() as db:
+            db.execute("INSERT INTO item (category_id, brand, item_no, name, note, is_active) "
+                       "VALUES (1, 'B', '1', 'x', '', 1)")
+            db.execute('INSERT INTO "user" VALUES (1, \'u\', \'h\', \'admin\', 1, \'2026-01-01 00:00:00\')')
+        with transaction() as db:
+            db.execute("INSERT INTO item_note (item_id, target, body, is_resolved, user_id, created_at) "
+                       "VALUES (1, '', 'x', 0, 1, datetime('now'))")
+
+
+def test_unknown_future_revision_is_refused_clearly(tmp_path):
+    path = str(tmp_path / "future.db")
+    raw = sqlite3.connect(path)
+    raw.executescript(SQLALCHEMY_DDL)
+    raw.execute("INSERT INTO alembic_version VALUES ('9999future')")
+    raw.commit()
+    raw.close()
+
+    class Cfg(TestConfig):
+        DATABASE = path
+
+    app = create_app(Cfg)
+    with app.app_context():
+        with pytest.raises(RuntimeError, match="未対応のSQLAlchemy版リビジョン"):
+            migrate(get_db())

@@ -125,3 +125,14 @@ def test_init_db_cli_still_works_on_missing_db(tmp_path):
     r = app.test_cli_runner().invoke(args=["init-db"])
     assert r.exit_code == 0 and os.path.exists(path)
     assert app.test_client().get("/login").status_code == 200
+
+
+# ---- 改ざん・古いセッションCookie(署名は正しくても、中身が想定外)でも500にならない -----------
+
+@pytest.mark.parametrize("value", [f"{BIG}:abc", "²:abc", "-1:abc", ":", "abc", ""])
+def test_unexpected_session_user_id_does_not_crash(client, value):
+    with client.session_transaction() as s:
+        s["_user_id"] = value
+        s["_fresh"] = True
+    r = client.get("/")
+    assert r.status_code == 302 and "/login" in r.headers["Location"]

@@ -1,4 +1,9 @@
-# 在庫管理アプリ (Flask)
+# 在庫管理アプリ (Flask) — sqlite3 版
+
+> **この版は、標準の `sqlite3` だけで動く軽量版です。** 機能・画面・挙動は、SQLAlchemy + Flask-Migrate を使う
+> 「SQLAlchemy 版」(`inventory_app_sqlalchemy`)と同じになるよう揃えてあります(画面のテンプレートは同一ファイルです)。
+> PostgreSQL など SQLite 以外のDBを使いたいときは、SQLAlchemy 版を使ってください。
+> 詳しくは「2つの版の関係」を参照してください。
 
 Tシャツ・キャップ・カバン・バッジ等の「無地在庫」と、シルクスクリーン「プリント済み製品」の在庫管理。
 Tailscale VPN 内の端末(iPad / iPhone / Windows / Android)からブラウザで使います。
@@ -14,9 +19,11 @@ export FLASK_APP=run.py            # Windows(PowerShell): $env:FLASK_APP="run.py
 flask init-db                      # DB(instance/inventory.db)を作成・更新
 flask seed                         # 初期カテゴリー(Tシャツ/キャップ/カバン/バッジ)
 flask create-user 管理者名 --admin  # 最初の管理者(パスワードを聞かれます)
+flask list-users                   # 登録済みユーザーの確認(パスワードは表示されません)
 ```
 
 アプリを更新したら `flask init-db` をもう一度実行してください(何度実行しても安全です)。
+実行を忘れても、画面には「データベースの更新が必要です」(503)が出るだけで、実行すれば再起動なしで直ります。
 未実行のままアクセスすると、「データベースの更新が必要です」(503)と表示されます。
 実行すれば、再起動しなくても使えるようになります。
 
@@ -98,17 +105,34 @@ export INVENTORY_BEHIND_PROXY=1
 - 停止中の品番には入荷・プリント変換ができません(残り在庫の出荷・調整はできます)。
 - 使用中(在庫のある)の「色・サイズ・種類名」の設定は、カテゴリー編集でOFFにできません。
 
-## 旧版(SQLAlchemy版)のDBについて
+## SQLAlchemy 版で作ったDBについて
 
-旧版で作った `inventory.db` も、`flask init-db` で引き継げます(本物の旧版DDLでテスト済みです)。
-旧版の品番の「メモ」欄に書かれていた内容は、備考に移されます。
+SQLAlchemy 版で作った `inventory.db` も、`flask init-db` で引き継げます(SQLAlchemy 版が実際に作ったDDLでテスト済みです)。
+以前の品番の「メモ」欄に書かれていた内容は、備考に移されます。
 引き継ぎ前に、必ず `inventory.db` をコピーして保管してください。
+
+## 2つの版の関係
+
+| | sqlite3 版(この版) | SQLAlchemy 版 |
+|---|---|---|
+| DBアクセス | 標準の `sqlite3` | SQLAlchemy + Flask-Migrate |
+| DB作成・更新 | `flask init-db` | `flask db upgrade` |
+| 使えるDB | SQLite のみ | SQLite / PostgreSQL ほか |
+| メモリ(gunicorn 1ワーカー) | 約37MB | 約71MB |
+| 画面・機能・挙動 | 同じ(テンプレート・CSS・JSは同一ファイル) | 同じ |
+
+**DBファイルは、どちらの版でも使えます**(同じテーブル構造です)。
+
+- **SQLAlchemy 版 → この版へ**: `flask init-db` を実行するだけで引き継がれます(SQLAlchemy 版が進めたリビジョンも判別します)。
+- **この版 → SQLAlchemy 版へ**: SQLAlchemy 版で、一度だけ `flask db stamp head` を実行してから、`flask db upgrade` します。
+
+どちらに切り替える場合も、先に `inventory.db` をコピーして保管してください。
 
 ## DBスキーマを変えるとき
 
 `app/schema.py` の `MIGRATIONS` の**末尾に**SQLを1つ足して、`flask init-db` を実行します。
 適用済みの番号は SQLite の `PRAGMA user_version` に保存されるので、何度実行しても安全です。
-(旧版の SQLAlchemy + Alembic で作ったDBは、構造が同じなのでそのまま引き継がれます。)
+(SQLAlchemy 版で作ったDBも、構造が同じなのでそのまま引き継がれます。)
 
 ## テスト
 

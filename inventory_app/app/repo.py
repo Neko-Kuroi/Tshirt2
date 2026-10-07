@@ -34,7 +34,8 @@ def get_user(user_id):
 def load_session_user(session_id):
     """Flask-Login 用。'ユーザーID:トークン' が一致しなければ(パスワード変更後など)None。"""
     uid, _, token = (session_id or "").partition(":")
-    user = get_user(int(uid)) if uid.isdigit() else None
+    uid = to_int(uid)  # 範囲外・数字以外は None(改ざんされたCookieでも落ちない)
+    user = get_user(uid) if uid is not None else None
     if user and hmac.compare_digest(token, user.session_token()):
         return user
     return None

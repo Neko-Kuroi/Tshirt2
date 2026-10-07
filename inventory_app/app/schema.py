@@ -1,7 +1,7 @@
 """スキーマとマイグレーション。
 
 MIGRATIONS に SQL を末尾へ追加していくだけ。適用済みの番号は PRAGMA user_version に保存される。
-(旧版の SQLAlchemy + Alembic で作ったDBも、同じ構造なので user_version=1 として引き継ぐ)
+(SQLAlchemy 版 = SQLAlchemy + Alembic で作ったDBも、同じ構造なので、その進み具合のまま引き継ぐ)
 """
 
 MIGRATIONS = [
@@ -100,13 +100,36 @@ def is_current(db) -> bool:
     return current_version(db) >= len(MIGRATIONS)
 
 
+# SQLAlchemy 版(SQLAlchemy + Alembic)のリビジョン → 対応するスキーマ番号
+SQLALCHEMY_REVISIONS = {"afd0c4cd0c7c": 1, "0002itemnote": 2}
+
+
+def _table_exists(db, name) -> bool:
+    return bool(db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone())
+
+
+def _sqlalchemy_version(db) -> int:
+    """user_version が未設定のDBが、SQLAlchemy 版で作られたものなら、どこまで進んでいるかを返す(新規DBは0)。"""
+    if not _table_exists(db, "category"):
+        return 0
+    row = (db.execute("SELECT version_num FROM alembic_version").fetchone()
+           if _table_exists(db, "alembic_version") else None)
+    if row:
+        rev = row["version_num"]
+        if rev not in SQLALCHEMY_REVISIONS:
+            raise RuntimeError(f"未対応のSQLAlchemy版リビジョンです: {rev!r}(この版が対応していない、より新しいリビジョンのDBの可能性があります)")
+        return SQLALCHEMY_REVISIONS[rev]
+    return 2 if _table_exists(db, "item_note") else 1  # Alembic の記録が無いDBは、表の有無で判断する
+
+
 def migrate(db) -> int:
     v = current_version(db)
-    has_tables = db.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='category'").fetchone()
-    if v == 0 and has_tables:  # 旧版で作成済みのDB
-        db.execute("PRAGMA user_version=1")
-        v = 1
+    if v == 0:
+        adopted = _sqlalchemy_version(db)
+        if adopted:  # SQLAlchemy 版で作成済みのDBを、その進み具合のまま引き継ぐ
+            db.execute(f"PRAGMA user_version={adopted}")
+            v = adopted
     for n, sql in enumerate(MIGRATIONS[v:], start=v + 1):
         try:
             db.executescript(f"BEGIN;\n{sql}\nPRAGMA user_version={n};\nCOMMIT;")

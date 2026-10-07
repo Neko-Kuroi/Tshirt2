@@ -48,5 +48,6 @@ def safe_next(target):
 
 
 def is_unique_violation(exc) -> bool:
-    """sqlite3.IntegrityError が UNIQUE 違反か。他の制約違反を『重複』と誤表示しないために使う。"""
-    return "UNIQUE constraint failed" in str(exc)
+    """IntegrityError が UNIQUE 違反か(SQLite / PostgreSQL 共通)。
+    他の制約違反(NOT NULL など)を『重複』と誤表示しないために使う。"""
+    return "unique constraint" in str(exc).lower()
