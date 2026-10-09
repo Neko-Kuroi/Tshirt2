@@ -1,0 +1,405 @@
+diff --git a/inventory_app/README.md b/inventory_app/README.md
+index 7c6ddfd..8772a33 100644
+--- a/inventory_app/README.md
++++ b/inventory_app/README.md
+@@ -73,6 +73,7 @@ export INVENTORY_BEHIND_PROXY=1
+ 4. 「出荷・調整」で出荷、棚卸しの差分調整(理由必須)
+ 5. 「履歴」で いつ・誰が・何を変えたか を確認
+ 6. 「備考」で、品番ごと(または色ごと)の自由なメモを残す(下記)
++7. 「無地在庫」「プリント済み」の画面のCSVボタンで、在庫をExcel用に出力(下記)
+ 
+ ## 備考(メモ)
+ 
+@@ -83,6 +84,20 @@ export INVENTORY_BEHIND_PROXY=1
+ - 未対応の備考は、ダッシュボード・入荷画面・「備考」メニューに出ます。片付いたら「対応済みにする」(戻すことも可)。
+ - 削除できるのは管理者だけです。書いた人と日時が記録されます。
+ 
++## CSV出力
++
++在庫をExcelでレポートにするための出力です(**入力・取り込みはありません**)。ログインしていれば、スタッフも使えます。
++
++| URL | 内容 |
++|---|---|
++| `/export/blank.csv` | 無地在庫(`?category=ID` で1カテゴリーに絞れる) |
++| `/export/printed.csv` | プリント済み在庫 |
++
++- UTF-8(BOM付き)・改行CRLFで、Excelでそのまま開けます。ファイル名に日本時間の日付が付きます。
++- 在庫0の行も出します。見出しは日本語です。
++- `=` `+` `-` `@` で始まる文字列には `'` を付けます(Excelが数式として実行するのを防ぐため)。
++- 実装は `app/services/export.py`、テストは `tests/test_export.py` です。
++
+ ## カテゴリーの設定
+ 
+ | 設定 | 意味 |
+diff --git a/inventory_app/app/inventory/routes.py b/inventory_app/app/inventory/routes.py
+index e7b46fa..49cf803 100644
+--- a/inventory_app/app/inventory/routes.py
++++ b/inventory_app/app/inventory/routes.py
+@@ -1,12 +1,14 @@
+ from collections import OrderedDict
++from datetime import datetime
+ 
+-from flask import abort, current_app, flash, redirect, render_template, request, url_for
++from flask import (Response, abort, current_app, flash, redirect, render_template, request,
++                   url_for)
+ from flask_login import current_user, login_required
+ 
+-from .. import repo
++from .. import JST, repo
+ from ..db import transaction
+ from ..models import KINDS
+-from ..services import stock
++from ..services import export, stock
+ from ..services.stock import StockError
+ from ..utils import safe_next, size_key, to_int
+ from . import bp
+@@ -219,3 +221,26 @@ def note_delete(note_id):
+         db.execute("DELETE FROM item_note WHERE id = ?", (note_id,))
+     flash("備考を削除しました。", "success")
+     return redirect(safe_next(request.form.get("back")) or url_for("inventory.notes"))
++
++
++# ---- CSV出力(Excelで在庫レポートを見る用) ---------------------------
++
++def _csv_response(name, headers, rows):
++    stamp = datetime.now(JST).strftime("%Y%m%d")
++    resp = Response(export.to_csv_bytes(headers, rows), mimetype="text/csv")
++    resp.headers["Content-Type"] = "text/csv; charset=utf-8"
++    resp.headers["Content-Disposition"] = f'attachment; filename="{name}_{stamp}.csv"'
++    resp.headers["Cache-Control"] = "no-store"  # 在庫データなので、共有キャッシュに残さない
++    return resp
++
++
++@bp.route("/export/blank.csv")
++def export_blank():
++    """無地在庫の一覧。?category=ID で1カテゴリーに絞れる(存在しないIDは空のCSV)。"""
++    cat_id = to_int(request.args.get("category"))
++    return _csv_response("inventory_blank", export.BLANK_HEADERS, export.blank_rows(cat_id))
++
++
++@bp.route("/export/printed.csv")
++def export_printed():
++    return _csv_response("inventory_printed", export.PRINTED_HEADERS, export.printed_rows())
+diff --git a/inventory_app/app/repo.py b/inventory_app/app/repo.py
+index 6bab411..3192ae0 100644
+--- a/inventory_app/app/repo.py
++++ b/inventory_app/app/repo.py
+@@ -107,7 +107,7 @@ def items_admin(category_id=None):
+ _VARIANT = """
+ SELECT v.id, v.item_id, v.color, v.size, v.variant_name, v.quantity,
+        i.brand, i.item_no, i.name AS item_name, i.is_active AS item_active,
+-       i.category_id, c.name AS category_name, c.is_printable
++       i.category_id, c.name AS category_name, c.sort_order AS category_order, c.is_printable
+ FROM variant v
+ JOIN item i ON i.id = v.item_id
+ JOIN category c ON c.id = i.category_id
+@@ -167,7 +167,8 @@ def used_colors():
+ _PRODUCT = """
+ SELECT p.id, p.design_id, p.variant_id, p.quantity, d.name AS design_name,
+        v.color, v.size, v.variant_name,
+-       i.id AS item_id, i.brand, i.item_no, i.name AS item_name, c.name AS category_name
++       i.id AS item_id, i.brand, i.item_no, i.name AS item_name,
++       c.name AS category_name, c.sort_order AS category_order
+ FROM printed_product p
+ JOIN design d ON d.id = p.design_id
+ JOIN variant v ON v.id = p.variant_id
+diff --git a/inventory_app/app/services/export.py b/inventory_app/app/services/export.py
+new file mode 100644
+index 0000000..ca55010
+--- /dev/null
++++ b/inventory_app/app/services/export.py
+@@ -0,0 +1,49 @@
++"""CSV出力(Excelで開いてレポートにする用途)。
++
++- 文字コードは UTF-8 の BOM 付き(Excel で日本語が文字化けしない)。改行は CRLF。
++- 在庫 0 の行も出す(「無い」ことも報告したいため)。
++- Excel の数式として実行されないよう、= + - @ などで始まる文字列には ' を付ける(CSVインジェクション対策)。
++"""
++import csv
++import io
++
++from .. import repo
++from ..utils import size_key
++
++BOM = "\ufeff"
++_FORMULA_HEAD = ("=", "+", "-", "@", "\t", "\r")
++
++BLANK_HEADERS = ["カテゴリー", "ブランド", "品番", "商品名", "色", "サイズ", "種類名", "数量", "品番の状態"]
++PRINTED_HEADERS = ["デザイン", "カテゴリー", "ブランド", "品番", "商品名", "色", "サイズ", "種類名", "数量"]
++
++
++def safe_cell(value):
++    """文字列だけを無害化する。数量などの整数はそのまま(Excelで数値として扱える)。"""
++    if isinstance(value, str) and value.startswith(_FORMULA_HEAD):
++        return "'" + value
++    return value
++
++
++def to_csv_bytes(headers, rows) -> bytes:
++    buf = io.StringIO(newline="")
++    w = csv.writer(buf)  # 既定の改行は CRLF
++    w.writerow(headers)
++    for r in rows:
++        w.writerow([safe_cell(c) for c in r])
++    return (BOM + buf.getvalue()).encode("utf-8")
++
++
++def blank_rows(category_id=None):
++    vs = [v for v in repo.all_variants() if category_id is None or v["category_id"] == category_id]
++    vs.sort(key=lambda v: (v["category_order"], v["brand"], v["item_no"], v["item_id"],
++                           v["variant_name"], v["color"], size_key(v["size"])))
++    return [[v["category_name"], v["brand"], v["item_no"], v["item_name"], v["color"], v["size"],
++             v["variant_name"], v["quantity"], "使用中" if v["item_active"] else "停止中"] for v in vs]
++
++
++def printed_rows():
++    ps = repo.products()
++    ps.sort(key=lambda p: (p["design_name"], p["category_order"], p["brand"], p["item_no"],
++                           p["item_id"], p["variant_name"], p["color"], size_key(p["size"])))
++    return [[p["design_name"], p["category_name"], p["brand"], p["item_no"], p["item_name"],
++             p["color"], p["size"], p["variant_name"], p["quantity"]] for p in ps]
+diff --git a/inventory_app/app/templates/inventory/blank_list.html b/inventory_app/app/templates/inventory/blank_list.html
+index 321f2fe..e4aaae7 100644
+--- a/inventory_app/app/templates/inventory/blank_list.html
++++ b/inventory_app/app/templates/inventory/blank_list.html
+@@ -2,7 +2,13 @@
+ {% from "_notes.html" import note_list, note_form %}
+ {% block title %}無地在庫 | 在庫管理{% endblock %}
+ {% block content %}
+-<h1 class="page-title">無地在庫</h1>
++<div class="d-flex justify-content-between align-items-baseline flex-wrap gap-2">
++  <h1 class="page-title">無地在庫</h1>
++  <span class="d-flex gap-2">
++    {% if cat %}<a class="btn btn-sm btn-outline-secondary" href="{{ url_for('inventory.export_blank', category=cat.id) }}">CSV(この分類)</a>{% endif %}
++    <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('inventory.export_blank') }}">CSV(すべて)</a>
++  </span>
++</div>
+ {% if not cats %}
+   <div class="panel">カテゴリーがありません。</div>
+ {% else %}
+diff --git a/inventory_app/app/templates/inventory/printed_list.html b/inventory_app/app/templates/inventory/printed_list.html
+index 87ff93b..6517404 100644
+--- a/inventory_app/app/templates/inventory/printed_list.html
++++ b/inventory_app/app/templates/inventory/printed_list.html
+@@ -1,7 +1,10 @@
+ {% extends "base.html" %}
+ {% block title %}プリント済み | 在庫管理{% endblock %}
+ {% block content %}
+-<h1 class="page-title">プリント済み在庫</h1>
++<div class="d-flex justify-content-between align-items-baseline flex-wrap gap-2">
++  <h1 class="page-title">プリント済み在庫</h1>
++  <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('inventory.export_printed') }}">CSVダウンロード</a>
++</div>
+ <form class="mb-3 d-flex gap-2" method="get">
+   <input class="form-control" name="q" value="{{ q }}" placeholder="デザイン・品番・色で検索" type="search">
+   <button class="btn btn-primary">検索</button>
+diff --git a/inventory_app/how_to_use.md b/inventory_app/how_to_use.md
+index b73979d..524ca4a 100644
+--- a/inventory_app/how_to_use.md
++++ b/inventory_app/how_to_use.md
+@@ -100,6 +100,20 @@ Tシャツ・キャップ・カバン・バッジなどの在庫を、スマホ
+ - 上の選択欄で、「入荷だけ」「出荷だけ」のように絞り込めます。
+ - 時刻は日本時間で表示されます。
+ 
++### CSVで出力する(Excelで在庫レポートを見る)
++「無地在庫」と「プリント済み」の画面の右上に、CSVのボタンがあります。
++- **無地在庫**: 「CSV(この分類)」は今開いているカテゴリーだけ、「CSV(すべて)」は全カテゴリーです。
++- **プリント済み**: 「CSVダウンロード」で、全デザインが出ます。
++
++ダウンロードしたファイルをダブルクリックすると、Excelでそのまま開けます(日本語も文字化けしません)。ファイル名には出力した日付が付きます(例: `inventory_blank_20261009.csv`)。
++
++ポイント:
++- **在庫が0の行も出ます。** 「在庫切れ」もレポートに載せるためです。
++- 無地在庫のCSVの「品番の状態」列には、「使用中」か「停止中」が入ります。
++- 並び順は、カテゴリー → ブランド → 品番 → 色 → サイズ(S, M, L, XLの順)です。
++- Excelの「ピボットテーブル」を使うと、色別・サイズ別の集計がすぐ作れます。
++- CSVは**見るための出力**です。Excelで直して取り込む機能はありません。
++
+ ### 備考(メモ)を残す
+ 仕入れ先の変更や「この色は入荷が最後」のような連絡事項を、品番ごとに残せます。
+ 1. 「無地在庫」で、品番のカードにある「備考を追加」を押します。
+diff --git a/inventory_app/tests/test_export.py b/inventory_app/tests/test_export.py
+new file mode 100644
+index 0000000..53048b4
+--- /dev/null
++++ b/inventory_app/tests/test_export.py
+@@ -0,0 +1,179 @@
++import csv
++import io
++
++import pytest
++
++import app.db as db_module
++from app import repo
++from app.db import get_db, transaction
++from app.services import export, stock
++
++PATHS = ["/export/blank.csv", "/export/printed.csv"]
++
++
++def _admin():
++    return repo.get_user_by_name("admin")
++
++
++def _item_id(brand="Printstar"):
++    return get_db().execute("SELECT id FROM item WHERE brand = ?", (brand,)).fetchone()["id"]
++
++
++def _receive(brand, color, size, qty, variant_name=""):
++    with transaction():
++        v = stock.get_or_create_variant(repo.get_item(_item_id(brand)), color, size, variant_name)
++        stock.receive(_admin(), v, qty)
++        return v
++
++
++def _rows(resp):
++    """レスポンスを、Excelと同じように BOM 付き UTF-8 として読み、行のリストにする。"""
++    return list(csv.reader(io.StringIO(resp.data.decode("utf-8-sig"), newline="")))
++
++
++def test_login_required(client):
++    for path in PATHS:
++        r = client.get(path)
++        assert r.status_code == 302 and "/login" in r.headers["Location"], path
++
++
++def test_staff_can_download(client, login):
++    login("staff")
++    for path in PATHS:
++        assert client.get(path).status_code == 200, path
++
++
++def test_blank_csv_format_for_excel(client, login, app):
++    _receive("Printstar", "黒", "M", 10)
++    login("staff")
++    r = client.get("/export/blank.csv")
++    assert r.status_code == 200
++    assert r.headers["Content-Type"] == "text/csv; charset=utf-8"
++    assert r.headers["Content-Disposition"].startswith('attachment; filename="inventory_blank_')
++    assert r.headers["Content-Disposition"].endswith('.csv"')
++    assert r.headers["Cache-Control"] == "no-store"
++    assert r.data.startswith(b"\xef\xbb\xbf")        # BOM(Excelの文字化け防止)
++    assert b"\r\n" in r.data                          # CRLF
++    rows = _rows(r)
++    assert rows[0] == export.BLANK_HEADERS
++    assert ["Tシャツ", "Printstar", "085-CVT", "Tシャツ", "黒", "M", "", "10", "使用中"] in rows
++
++
++def test_quantity_is_plain_number_and_zero_rows_are_included(client, login, app):
++    _receive("Printstar", "黒", "M", 5)
++    _receive("Printstar", "白", "M", 3)
++    with transaction():
++        stock.ship(_admin(), repo.find_variant(_item_id(), "白", "M", ""), 3)
++    login()
++    resp = client.get("/export/blank.csv")
++    raw = resp.data.decode("utf-8-sig")
++    assert '"5"' not in raw and '"0"' not in raw       # 数量は引用符なしの数値(Excelで数値になる)
++    rows = _rows(resp)
++    assert next(r for r in rows if r[4] == "黒")[7] == "5"
++    assert next(r for r in rows if r[4] == "白")[7] == "0"   # 在庫0の行も出る
++
++
++def test_stopped_item_is_marked(client, login, app):
++    _receive("United Athle", "赤", "L", 2)
++    with transaction() as db:
++        db.execute("UPDATE item SET is_active = 0 WHERE brand = 'United Athle'")
++    login()
++    row = next(r for r in _rows(client.get("/export/blank.csv")) if r[1] == "United Athle")
++    assert row[8] == "停止中"
++
++
++def test_sizes_are_in_natural_order(client, login, app):
++    for size in ["XL", "S", "L", "M"]:
++        _receive("Printstar", "黒", size, 1)
++    login()
++    sizes = [r[5] for r in _rows(client.get("/export/blank.csv")) if r[1] == "Printstar"]
++    assert sizes == ["S", "M", "L", "XL"]
++
++
++def test_category_filter(client, login, app):
++    _receive("Printstar", "黒", "M", 1)
++    _receive("", "", "", 4, variant_name="赤")          # バッジ(カテゴリー2)
++    login()
++    both = _rows(client.get("/export/blank.csv"))
++    assert {r[0] for r in both[1:]} == {"Tシャツ", "バッジ"}
++    only = _rows(client.get("/export/blank.csv?category=2"))
++    assert {r[0] for r in only[1:]} == {"バッジ"}
++    assert _rows(client.get("/export/blank.csv?category=999"))[1:] == []   # 存在しないIDは見出しだけ
++    assert len(_rows(client.get("/export/blank.csv?category=abc"))) == len(both)  # 不正な値は全件
++    assert client.get(f"/export/blank.csv?category={10**30}").status_code == 200  # 巨大な値でも500にならない
++
++
++def test_special_characters_round_trip(client, login, app):
++    with transaction() as db:
++        db.execute("UPDATE item SET name = ? WHERE brand = 'Printstar'", ('A,"B"\nC',))
++    _receive("Printstar", "黒", "M", 1)
++    login()
++    row = next(r for r in _rows(client.get("/export/blank.csv")) if r[1] == "Printstar")
++    assert row[3] == 'A,"B"\nC'
++
++
++@pytest.mark.parametrize("evil", ["=1+1", "+1", "-1", "@SUM(A1)", "\t=1"])
++def test_formula_injection_is_neutralized(client, login, app, evil):
++    with transaction() as db:
++        db.execute("UPDATE item SET name = ? WHERE brand = 'Printstar'", (evil,))
++    _receive("Printstar", "黒", "M", 1)
++    login()
++    row = next(r for r in _rows(client.get("/export/blank.csv")) if r[1] == "Printstar")
++    assert row[3] == "'" + evil
++
++
++def test_safe_cell_leaves_normal_values_alone():
++    assert export.safe_cell("黒") == "黒"
++    assert export.safe_cell("") == ""
++    assert export.safe_cell(0) == 0 and export.safe_cell(12) == 12
++
++
++def test_printed_csv(client, login, app):
++    v = _receive("Printstar", "黒", "M", 10)
++    with transaction():
++        stock.convert_to_printed(_admin(), v, "ねこロゴ", 6, 5)
++    login()
++    rows = _rows(client.get("/export/printed.csv"))
++    assert rows[0] == export.PRINTED_HEADERS
++    assert ["ねこロゴ", "Tシャツ", "Printstar", "085-CVT", "Tシャツ", "黒", "M", "", "5"] in rows
++
++
++def test_empty_database_gives_header_only(client, login):
++    login()
++    for path, headers in zip(PATHS, [export.BLANK_HEADERS, export.PRINTED_HEADERS]):
++        assert _rows(client.get(path)) == [headers]
++
++
++def _count_queries(client, path, monkeypatch):
++    statements = []
++    real = db_module.connect
++
++    def counting(p):
++        conn = real(p)
++        conn.set_trace_callback(statements.append)
++        return conn
++
++    monkeypatch.setattr(db_module, "connect", counting)
++    assert client.get(path).status_code == 200
++    monkeypatch.setattr(db_module, "connect", real)
++    return len(statements)
++
++
++@pytest.mark.parametrize("path", PATHS)
++def test_query_count_does_not_grow_with_rows(client, login, monkeypatch, path):
++    login()
++
++    def seed(start, n):
++        for i in range(start, start + n):
++            with transaction() as db:
++                item_id = db.execute(
++                    "INSERT INTO item (category_id, brand, item_no, name) VALUES (1, ?, ?, 'T')",
++                    (f"B{i}", f"N{i}")).lastrowid
++                v = stock.get_or_create_variant(repo.get_item(item_id), "黒", "M")
++                stock.receive(_admin(), v, 10)
++                stock.convert_to_printed(_admin(), v, f"D{i}", 5, 5)
++
++    seed(0, 3)
++    small = _count_queries(client, path, monkeypatch)
++    seed(3, 12)
++    assert _count_queries(client, path, monkeypatch) == small
